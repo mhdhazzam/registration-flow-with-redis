@@ -1,63 +1,96 @@
-const http = require('http');
 const redis = require('redis');
+const bcrypt = require('bcrypt');
 
+// Add redis stream commands
+redis.add_command('xadd');
+redis.add_command('xreadgroup');
+redis.add_command('xgroup');
+redis.addCommand('xack');
+
+// Create redis client
 const redisClient = redis.createClient({
   host: process.env.REDIS_HOST || 'localhost',
   port: process.env.REDIS_PORT || 6379
 });
 
+redisClient.on('connect', () => console.log('Connected Successfully'));
+
+redisClient.on('error', (err) => console.log('Redis Client Error', err));
 
 
+const incomingStreamName = 'registration-request';
+const streamGroupName = 'registration-flow';
+const outgoingStreamName = 'registration-result';
 
-const port = process.env.PORT || 3000;
-const host = process.env.HOST || 'localhost';
+const serviceIdentifier = 's-0';
 
-const requestListener = async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  try {
-    switch (req.url) {
-      case "/register":
-        if (req.method === 'POST') {
-          const buffers = [];
-          for await (const chunk of req) {
-            buffers.push(chunk);
-          }
-          const dataString = Buffer.concat(buffers).toString();
-          const { email, username, password } = JSON.parse(dataString);
-          if (!email) {
-            res.writeHead(400);
-            res.end(JSON.stringify({ message: "email is required!" }));
-            return;
-          }
-          if (!username) {
-            res.writeHead(400);
-            res.end(JSON.stringify({ message: "username is required!" }));
-            return;
-          }
-          if (!password) {
-            res.writeHead(400);
-            res.end(JSON.stringify({ message: "password is required!" }));
-            return;
-          }
-          res.writeHead(204);
-          res.end();
-          return;
-        }
-        console.log(' iam outt')
-        res.writeHead(404);
-        res.end(JSON.stringify({ error: "Resource not found" }));
-        break;
-      default:
-        res.writeHead(404);
-        res.end(JSON.stringify({ error: "Resource not found" }));
-    }
-  } catch (error) {
-    res.writeHead(500);
-    res.end(JSON.stringify({ error: "Unhandled error" }));
+// Create the stream group and create the stream if is not exist before
+redisClient.xgroup('CREATE', incomingStreamName, streamGroupName, '$', 'MKSTREAM', (err, res) => {
+  if (err && err.message !== 'BUSYGROUP Consumer Group name already exists') {
+    console.log(`couldn't create ${streamGroupName} group`);
+    console.log('Error: ', err);
+    process.exit(1);
   }
-};
-
-const server = http.createServer(requestListener);
-server.listen(port, host, () => {
-  console.log(`Server is running on http://${host}:${port}`);
 });
+
+// Create a function to read from the group 
+const redisStreamGroup = ({ streamName, id, streamGroupName, serviceIdentifier }) => {
+  // listen to the stream group until a new message arrives, then consume it
+  redisClient.xreadgroup('GROUP', streamGroupName, serviceIdentifier, 'BLOCK', 0, 'STREAMS', streamName, id, (err, str) => {
+    if (err) {
+      return console.error('Error reading from stream:', err);
+    }
+    if (str[0][0] === streamName) {
+      str[0][1].forEach(message => {
+        const messageId = message[0];
+        const [, email, , username, , password] = message[1];
+        // Send an exception message to the exceptions stream
+        if (!email) {
+          redisClient.xadd('exceptions', '*', 'reqId', messageId, 'message', 'email is required!');
+        }
+        if (!username) {
+          redisClient.xadd('exceptions', '*', 'reqId', messageId, 'message', 'username is required!');
+        }
+        if (!password) {
+          redisClient.xadd('exceptions', '*', 'reqId', messageId, 'message', 'password is required!');
+        }
+        // If the data is correct, create the user record
+        if (email && username && password) {
+          redisClient.HMSET(`user:${email}`, {
+            username,
+            email,
+            password: bcrypt.hashSync(password, 7),
+            isActive: false,
+            createdAt: (new Date()).getTime()
+          }, (e) => {
+            if (e) {
+              console.log('Error: ', e);
+              return;
+            }
+            console.log('messageId ', messageId)
+            // Send a message about the newly created user
+            redisClient.xadd(outgoingStreamName, '*', 'reqId', messageId, 'data', `user:${email}`, (err, res) => {
+              if (err) {
+                console.log('Error: ', err);
+                return;
+              }
+              console.log('outgoing message id: ', res)
+            });
+          });
+        }
+        // Acknowledge the message
+        redisClient.xack(streamName, streamGroupName, messageId, (err) => {
+          if (err) {
+            console.log(err);
+          }
+          console.log('Ack message: ', messageId)
+        });
+      });
+    }
+    // listen the group messages again after finished from the previous message
+    setTimeout(() => redisStreamGroup({ streamName, id: '>', streamGroupName, serviceIdentifier }), 0)
+  });
+}
+
+// Invoke the service ^_^
+redisStreamGroup({ streamName: incomingStreamName, id: '>', streamGroupName, serviceIdentifier });
